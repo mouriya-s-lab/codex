@@ -2431,6 +2431,7 @@ dependencies = [
  "dunce",
  "futures",
  "gethostname",
+ "indexmap 2.13.0",
  "libc",
  "multimap",
  "pretty_assertions",
