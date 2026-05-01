@@ -555,6 +555,7 @@ async fn turn_start_tracks_turn_event_analytics() -> Result<()> {
             thread_id: thread.id.clone(),
             input: vec![V2UserInput::Image {
                 url: "https://example.com/a.png".to_string(),
+                detail: None,
             }],
             ..Default::default()
         })
@@ -1505,7 +1506,10 @@ async fn turn_start_accepts_local_image_input() -> Result<()> {
     let turn_req = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
-            input: vec![V2UserInput::LocalImage { path: image_path }],
+            input: vec![V2UserInput::LocalImage {
+                path: image_path,
+                detail: None,
+            }],
             ..Default::default()
         })
         .await?;

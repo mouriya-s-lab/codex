@@ -1078,11 +1078,17 @@ impl ThreadHistoryBuilder {
         }
         if let Some(images) = &payload.images {
             for image in images {
-                content.push(UserInput::Image { url: image.clone() });
+                content.push(UserInput::Image {
+                    url: image.clone(),
+                    detail: None,
+                });
             }
         }
         for path in &payload.local_images {
-            content.push(UserInput::LocalImage { path: path.clone() });
+            content.push(UserInput::LocalImage {
+                path: path.clone(),
+                detail: None,
+            });
         }
         content
     }
@@ -1288,6 +1294,7 @@ mod tests {
                     },
                     UserInput::Image {
                         url: "https://example.com/one.png".into(),
+                        detail: None,
                     }
                 ],
             }

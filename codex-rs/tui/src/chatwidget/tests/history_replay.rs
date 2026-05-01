@@ -117,6 +117,7 @@ async fn replayed_user_message_preserves_text_elements_and_local_images() {
             },
             AppServerUserInput::LocalImage {
                 path: local_images[0].clone(),
+                detail: None,
             },
         ],
         ReplayKind::ResumeInitialMessages,
@@ -185,6 +186,7 @@ async fn replayed_user_message_preserves_remote_image_urls() {
             },
             AppServerUserInput::Image {
                 url: remote_image_urls[0].clone(),
+                detail: None,
             },
         ],
         ReplayKind::ResumeInitialMessages,
@@ -373,6 +375,7 @@ async fn replayed_user_message_with_only_remote_images_renders_history_cell() {
         "user-1",
         vec![AppServerUserInput::Image {
             url: remote_image_urls[0].clone(),
+            detail: None,
         }],
         ReplayKind::ResumeInitialMessages,
     );
@@ -427,6 +430,7 @@ async fn replayed_user_message_with_only_local_images_renders_history_cell() {
         "user-1",
         vec![AppServerUserInput::LocalImage {
             path: local_images[0].clone(),
+            detail: None,
         }],
         ReplayKind::ResumeInitialMessages,
     );

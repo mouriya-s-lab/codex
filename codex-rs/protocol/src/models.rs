@@ -1065,6 +1065,22 @@ pub fn local_image_content_items_with_label_number(
     label_number: Option<usize>,
     mode: PromptImageMode,
 ) -> Vec<ContentItem> {
+    local_image_content_items_with_label_number_and_detail(
+        path,
+        file_bytes,
+        label_number,
+        mode,
+        DEFAULT_IMAGE_DETAIL,
+    )
+}
+
+fn local_image_content_items_with_label_number_and_detail(
+    path: &std::path::Path,
+    file_bytes: Vec<u8>,
+    label_number: Option<usize>,
+    mode: PromptImageMode,
+    detail: ImageDetail,
+) -> Vec<ContentItem> {
     match load_for_prompt_bytes(path, file_bytes, mode) {
         Ok(image) => {
             let mut items = Vec::with_capacity(3);
@@ -1075,7 +1091,7 @@ pub fn local_image_content_items_with_label_number(
             }
             items.push(ContentItem::InputImage {
                 image_url: image.into_data_url(),
-                detail: Some(DEFAULT_IMAGE_DETAIL),
+                detail: Some(detail),
             });
             if label_number.is_some() {
                 items.push(ContentItem::InputText {
@@ -1098,6 +1114,14 @@ pub fn local_image_content_items_with_label_number(
                 vec![unsupported_image_error_placeholder(path, mime)]
             }
         },
+    }
+}
+
+fn prompt_image_mode_for_detail(detail: ImageDetail) -> PromptImageMode {
+    if detail == ImageDetail::Original {
+        PromptImageMode::Original
+    } else {
+        PromptImageMode::ResizeToFit
     }
 }
 
@@ -1220,30 +1244,35 @@ impl From<Vec<UserInput>> for ResponseInputItem {
                 .into_iter()
                 .flat_map(|c| match c {
                     UserInput::Text { text, .. } => vec![ContentItem::InputText { text }],
-                    UserInput::Image { image_url } => {
+                    UserInput::Image { image_url, detail } => {
                         image_index += 1;
+                        let detail = detail.unwrap_or(DEFAULT_IMAGE_DETAIL);
                         vec![
                             ContentItem::InputText {
                                 text: image_open_tag_text(),
                             },
                             ContentItem::InputImage {
                                 image_url,
-                                detail: Some(DEFAULT_IMAGE_DETAIL),
+                                detail: Some(detail),
                             },
                             ContentItem::InputText {
                                 text: image_close_tag_text(),
                             },
                         ]
                     }
-                    UserInput::LocalImage { path } => {
+                    UserInput::LocalImage { path, detail } => {
                         image_index += 1;
+                        let detail = detail.unwrap_or(DEFAULT_IMAGE_DETAIL);
                         match std::fs::read(&path) {
-                            Ok(file_bytes) => local_image_content_items_with_label_number(
-                                &path,
-                                file_bytes,
-                                Some(image_index),
-                                PromptImageMode::ResizeToFit,
-                            ),
+                            Ok(file_bytes) => {
+                                local_image_content_items_with_label_number_and_detail(
+                                    &path,
+                                    file_bytes,
+                                    Some(image_index),
+                                    prompt_image_mode_for_detail(detail),
+                                    detail,
+                                )
+                            }
                             Err(err) => vec![local_image_error_placeholder(&path, err)],
                         }
                     }
@@ -1631,6 +1660,14 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
     use tempfile::tempdir;
+
+    // A tiny valid PNG (1x1) so image conversion tests don't depend on cross-crate
+    // file paths, which break under Bazel sandboxing.
+    const TINY_PNG_BYTES: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
+        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 11, 73, 68, 65, 84, 120, 156, 99, 96, 0, 2, 0, 0, 5, 0,
+        1, 122, 94, 171, 63, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
 
     #[test]
     fn response_input_message_conversion_preserves_phase() {
@@ -2536,6 +2573,7 @@ mod tests {
 
         let item = ResponseInputItem::from(vec![UserInput::Image {
             image_url: image_url.clone(),
+            detail: None,
         }]);
 
         match item {
@@ -2553,6 +2591,31 @@ mod tests {
                     },
                 ];
                 assert_eq!(content, expected);
+            }
+            other => panic!("expected message response but got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn image_user_input_preserves_requested_detail() -> Result<()> {
+        let image_url = "data:image/png;base64,abc".to_string();
+
+        let item = ResponseInputItem::from(vec![UserInput::Image {
+            image_url: image_url.clone(),
+            detail: Some(ImageDetail::Original),
+        }]);
+
+        match item {
+            ResponseInputItem::Message { content, .. } => {
+                assert_eq!(
+                    content.get(1),
+                    Some(&ContentItem::InputImage {
+                        image_url,
+                        detail: Some(ImageDetail::Original),
+                    })
+                );
             }
             other => panic!("expected message response but got {other:?}"),
         }
@@ -2728,20 +2791,17 @@ mod tests {
         let image_url = "data:image/png;base64,abc".to_string();
         let dir = tempdir()?;
         let local_path = dir.path().join("local.png");
-        // A tiny valid PNG (1x1) so this test doesn't depend on cross-crate file paths, which
-        // break under Bazel sandboxing.
-        const TINY_PNG_BYTES: &[u8] = &[
-            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
-            8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 11, 73, 68, 65, 84, 120, 156, 99, 96, 0, 2,
-            0, 0, 5, 0, 1, 122, 94, 171, 63, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
-        ];
         std::fs::write(&local_path, TINY_PNG_BYTES)?;
 
         let item = ResponseInputItem::from(vec![
             UserInput::Image {
                 image_url: image_url.clone(),
+                detail: None,
             },
-            UserInput::LocalImage { path: local_path },
+            UserInput::LocalImage {
+                path: local_path,
+                detail: None,
+            },
         ]);
 
         match item {
@@ -2789,12 +2849,49 @@ mod tests {
     }
 
     #[test]
+    fn local_image_user_input_preserves_requested_detail() -> Result<()> {
+        let dir = tempdir()?;
+        let local_path = dir.path().join("local.png");
+        std::fs::write(&local_path, TINY_PNG_BYTES)?;
+
+        assert_eq!(
+            prompt_image_mode_for_detail(ImageDetail::Original),
+            PromptImageMode::Original
+        );
+        assert_eq!(
+            prompt_image_mode_for_detail(ImageDetail::High),
+            PromptImageMode::ResizeToFit
+        );
+
+        let item = ResponseInputItem::from(vec![UserInput::LocalImage {
+            path: local_path,
+            detail: Some(ImageDetail::Original),
+        }]);
+
+        match item {
+            ResponseInputItem::Message { content, .. } => {
+                assert!(matches!(
+                    content.get(1),
+                    Some(ContentItem::InputImage {
+                        detail: Some(ImageDetail::Original),
+                        ..
+                    })
+                ));
+            }
+            other => panic!("expected message response but got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn local_image_read_error_adds_placeholder() -> Result<()> {
         let dir = tempdir()?;
         let missing_path = dir.path().join("missing-image.png");
 
         let item = ResponseInputItem::from(vec![UserInput::LocalImage {
             path: missing_path.clone(),
+            detail: None,
         }]);
 
         match item {
@@ -2829,6 +2926,7 @@ mod tests {
 
         let item = ResponseInputItem::from(vec![UserInput::LocalImage {
             path: json_path.clone(),
+            detail: None,
         }]);
 
         match item {
@@ -2866,6 +2964,7 @@ mod tests {
 
         let item = ResponseInputItem::from(vec![UserInput::LocalImage {
             path: svg_path.clone(),
+            detail: None,
         }]);
 
         match item {
