@@ -36,6 +36,7 @@ use codex_protocol::account::PlanType as AccountPlanType;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::exec_output::ExecToolCallOutput;
+use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
@@ -3339,6 +3340,27 @@ async fn session_configuration_apply_permission_profile_accepts_direct_write_roo
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
         }
+    );
+}
+
+#[tokio::test]
+async fn session_configuration_apply_permission_profile_preserves_supplied_active_profile() {
+    let session_configuration = make_session_configuration_for_tests().await;
+    let permission_profile = PermissionProfile::workspace_write();
+    let active_permission_profile = ActivePermissionProfile::new(":workspace");
+
+    let updated = session_configuration
+        .apply(&SessionSettingsUpdate {
+            permission_profile: Some(permission_profile.clone()),
+            active_permission_profile: Some(active_permission_profile.clone()),
+            ..Default::default()
+        })
+        .expect("permission profile update should succeed");
+
+    assert_eq!(updated.permission_profile(), permission_profile);
+    assert_eq!(
+        updated.active_permission_profile(),
+        Some(active_permission_profile)
     );
 }
 

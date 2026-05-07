@@ -9,6 +9,7 @@ use crate::app_event::AppEvent;
 use crate::app_event::ExitMode;
 use crate::app_event::FeedbackCategory;
 use crate::app_event::HistoryLookupResponse;
+use crate::app_event::PermissionProfileSelection;
 use crate::app_event::RateLimitRefreshOrigin;
 use crate::app_event::RealtimeAudioDeviceKind;
 #[cfg(target_os = "windows")]
@@ -138,6 +139,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::Personality;
 #[cfg(target_os = "windows")]
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelAvailabilityNux;
 use codex_protocol::openai_models::ModelPreset;
@@ -463,7 +465,7 @@ pub(crate) struct App {
     cli_kv_overrides: Vec<(String, TomlValue)>,
     harness_overrides: ConfigOverrides,
     runtime_approval_policy_override: Option<AskForApproval>,
-    runtime_permission_profile_override: Option<PermissionProfile>,
+    runtime_permission_profile_override: Option<RuntimePermissionProfileOverride>,
 
     pub(crate) file_search: FileSearchManager,
 
@@ -531,6 +533,23 @@ pub(crate) struct App {
     // Serialize hook enablement writes per hook so stale completions cannot
     // persist an older toggle after a newer one.
     pending_hook_enabled_writes: HashMap<String, Option<bool>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RuntimePermissionProfileOverride {
+    permission_profile: PermissionProfile,
+    active_permission_profile: Option<ActivePermissionProfile>,
+    network: Option<crate::legacy_core::config::NetworkProxySpec>,
+}
+
+impl RuntimePermissionProfileOverride {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            permission_profile: config.permissions.permission_profile(),
+            active_permission_profile: config.permissions.active_permission_profile(),
+            network: config.permissions.network.clone(),
+        }
+    }
 }
 
 fn active_turn_not_steerable_turn_error(error: &TypedRequestError) -> Option<AppServerTurnError> {

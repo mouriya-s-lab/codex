@@ -305,7 +305,10 @@ impl ChatWidget {
                         &[],
                     );
                     self.app_event_tx
-                        .send(AppEvent::BeginWindowsSandboxElevatedSetup { preset });
+                        .send(AppEvent::BeginWindowsSandboxElevatedSetup {
+                            preset,
+                            profile_selection: None,
+                        });
                 }
                 #[cfg(not(target_os = "windows"))]
                 {

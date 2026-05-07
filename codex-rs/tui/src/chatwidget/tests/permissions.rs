@@ -6,6 +6,7 @@ use codex_app_server_protocol::FileSystemSpecialPath;
 use codex_app_server_protocol::PermissionProfile as AppServerPermissionProfile;
 use codex_app_server_protocol::PermissionProfileFileSystemPermissions;
 use codex_app_server_protocol::PermissionProfileNetworkPermissions;
+use codex_protocol::models::ActivePermissionProfile;
 use pretty_assertions::assert_eq;
 
 fn app_server_workspace_write_profile(extra_root: AbsolutePathBuf) -> PermissionProfile {
@@ -63,6 +64,164 @@ async fn approvals_selection_popup_snapshot() {
     });
     #[cfg(not(target_os = "windows"))]
     assert_chatwidget_snapshot!("approvals_selection_popup", popup);
+}
+
+#[tokio::test]
+async fn profile_permissions_selection_popup_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.explicit_permission_profile_mode = true;
+    chat.config
+        .permissions
+        .set_permission_profile_with_active_profile(
+            PermissionProfile::workspace_write(),
+            Some(ActivePermissionProfile::new(":workspace")),
+        )
+        .expect("set active profile");
+
+    chat.open_permissions_popup();
+
+    assert_chatwidget_snapshot!(
+        "profile_permissions_selection_popup",
+        render_bottom_popup(&chat, /*width*/ 80)
+    );
+}
+
+#[tokio::test]
+async fn profile_permissions_selection_popup_with_custom_profiles_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.explicit_permission_profile_mode = true;
+    chat.config.custom_permission_profile_ids =
+        vec!["locked-down".to_string(), "web-enabled".to_string()];
+    chat.config
+        .permissions
+        .set_permission_profile_with_active_profile(
+            PermissionProfile::workspace_write(),
+            Some(ActivePermissionProfile::new("locked-down")),
+        )
+        .expect("set active profile");
+
+    chat.open_permissions_popup();
+
+    assert_chatwidget_snapshot!(
+        "profile_permissions_selection_popup_with_custom_profiles",
+        render_bottom_popup(&chat, /*width*/ 80)
+    );
+}
+
+#[tokio::test]
+async fn profile_permissions_selection_emits_named_profile_event_only() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.explicit_permission_profile_mode = true;
+    chat.config
+        .permissions
+        .set_permission_profile_with_active_profile(
+            PermissionProfile::workspace_write(),
+            Some(ActivePermissionProfile::new(":workspace")),
+        )
+        .expect("set active profile");
+
+    chat.open_permissions_popup();
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        &events[0],
+        AppEvent::SelectPermissionProfile(PermissionProfileSelection {
+            profile_id,
+            approval_policy: Some(AskForApproval::OnRequest),
+            approvals_reviewer: Some(ApprovalsReviewer::User),
+            display_label,
+        }) if profile_id == ":workspace" && display_label == "Default"
+    ));
+}
+
+#[tokio::test]
+async fn profile_permissions_selection_emits_active_custom_profile() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.explicit_permission_profile_mode = true;
+    chat.config.custom_permission_profile_ids = vec!["locked-down".to_string()];
+    chat.config
+        .permissions
+        .set_permission_profile_with_active_profile(
+            PermissionProfile::workspace_write(),
+            Some(ActivePermissionProfile::new("locked-down")),
+        )
+        .expect("set active profile");
+
+    chat.open_permissions_popup();
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        &events[0],
+        AppEvent::SelectPermissionProfile(PermissionProfileSelection {
+            profile_id,
+            approval_policy: None,
+            approvals_reviewer: None,
+            display_label,
+        }) if profile_id == "locked-down" && display_label == "locked-down"
+    ));
+}
+
+#[tokio::test]
+async fn profile_permissions_selection_emits_auto_review_mode_event() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.explicit_permission_profile_mode = true;
+    chat.config
+        .permissions
+        .set_permission_profile_with_active_profile(
+            PermissionProfile::workspace_write(),
+            Some(ActivePermissionProfile::new(":workspace")),
+        )
+        .expect("set active profile");
+
+    chat.open_permissions_popup();
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        &events[0],
+        AppEvent::SelectPermissionProfile(PermissionProfileSelection {
+            profile_id,
+            approval_policy: Some(AskForApproval::OnRequest),
+            approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
+            display_label,
+        }) if profile_id == ":workspace" && display_label == "Auto-review"
+    ));
+}
+
+#[tokio::test]
+async fn profile_permissions_full_access_opens_confirmation() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.explicit_permission_profile_mode = true;
+    chat.set_feature_enabled(Feature::GuardianApproval, /*enabled*/ false);
+    chat.config.notices.hide_full_access_warning = None;
+
+    chat.open_permissions_popup();
+    chat.handle_key_event(KeyEvent::from(KeyCode::Up));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        &events[0],
+        AppEvent::OpenFullAccessConfirmation {
+            preset,
+            return_to_permissions: true,
+            profile_selection: Some(PermissionProfileSelection {
+                profile_id,
+                approval_policy: Some(AskForApproval::Never),
+                approvals_reviewer: Some(ApprovalsReviewer::User),
+                display_label,
+            }),
+        } if preset.id == "full-access"
+            && profile_id == ":danger-no-sandbox"
+            && display_label == "Full Access"
+    ));
 }
 
 #[cfg(target_os = "windows")]
@@ -169,7 +328,9 @@ async fn full_access_confirmation_popup_snapshot() {
         .into_iter()
         .find(|preset| preset.id == "full-access")
         .expect("full access preset");
-    chat.open_full_access_confirmation(preset, /*return_to_permissions*/ false);
+    chat.open_full_access_confirmation(
+        preset, /*return_to_permissions*/ false, /*profile_selection*/ None,
+    );
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
     assert_chatwidget_snapshot!("full_access_confirmation_popup", popup);
@@ -779,8 +940,9 @@ async fn permissions_full_access_history_cell_emitted_only_after_confirmation() 
             AppEvent::OpenFullAccessConfirmation {
                 preset,
                 return_to_permissions,
+                profile_selection,
             } => {
-                open_confirmation_event = Some((preset, return_to_permissions));
+                open_confirmation_event = Some((preset, return_to_permissions, profile_selection));
             }
             _ => {}
         }
@@ -791,9 +953,9 @@ async fn permissions_full_access_history_cell_emitted_only_after_confirmation() 
             "did not expect history cell before confirming full access"
         );
     }
-    let (preset, return_to_permissions) =
+    let (preset, return_to_permissions, profile_selection) =
         open_confirmation_event.expect("expected full access confirmation event");
-    chat.open_full_access_confirmation(preset, return_to_permissions);
+    chat.open_full_access_confirmation(preset, return_to_permissions, profile_selection);
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
     assert!(
