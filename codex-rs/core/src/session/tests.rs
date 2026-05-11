@@ -7328,6 +7328,31 @@ async fn steer_input_requires_active_turn() {
 }
 
 #[tokio::test]
+async fn queued_turn_start_only_claims_one_idle_turn() {
+    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+    let queued_turn_op = || Op::UserInput {
+        items: vec![UserInput::Text {
+            text: "queued".to_string(),
+            text_elements: Vec::new(),
+        }],
+        environments: None,
+        final_output_json_schema: None,
+        responsesapi_client_metadata: None,
+    };
+
+    assert!(
+        super::handlers::maybe_start_queued_turn(&sess, "queued-1".to_string(), queued_turn_op(),)
+            .await
+    );
+    assert!(
+        !super::handlers::maybe_start_queued_turn(&sess, "queued-2".to_string(), queued_turn_op(),)
+            .await
+    );
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
 async fn steer_input_enforces_expected_turn_id() {
     let (sess, tc, _rx) = make_session_and_context_with_rx().await;
     let input = vec![UserInput::Text {

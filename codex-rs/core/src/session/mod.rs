@@ -185,7 +185,7 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::exec_output::StreamOutput;
 
 mod config_lock;
-mod handlers;
+pub(crate) mod handlers;
 mod mcp;
 mod multi_agents;
 mod review;
@@ -1401,6 +1401,11 @@ impl Session {
             .session_configuration
             .original_config_do_not_use
             .clone()
+    }
+
+    pub(crate) async fn thread_config_snapshot(&self) -> ThreadConfigSnapshot {
+        let state = self.state.lock().await;
+        state.session_configuration.thread_config_snapshot()
     }
 
     pub(crate) async fn provider(&self) -> ModelProviderInfo {

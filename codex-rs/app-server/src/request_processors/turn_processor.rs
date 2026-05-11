@@ -6,9 +6,7 @@ pub(crate) struct TurnRequestProcessor {
     thread_manager: Arc<ThreadManager>,
     outgoing: Arc<OutgoingMessageSender>,
     analytics_events_client: AnalyticsEventsClient,
-    arg0_paths: Arg0DispatchPaths,
     config: Arc<Config>,
-    config_manager: ConfigManager,
     pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
     thread_state_manager: ThreadStateManager,
     thread_watch_manager: ThreadWatchManager,
@@ -29,9 +27,7 @@ impl TurnRequestProcessor {
         thread_manager: Arc<ThreadManager>,
         outgoing: Arc<OutgoingMessageSender>,
         analytics_events_client: AnalyticsEventsClient,
-        arg0_paths: Arg0DispatchPaths,
         config: Arc<Config>,
-        config_manager: ConfigManager,
         pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
         thread_state_manager: ThreadStateManager,
         thread_watch_manager: ThreadWatchManager,
@@ -42,9 +38,7 @@ impl TurnRequestProcessor {
             thread_manager,
             outgoing,
             analytics_events_client,
-            arg0_paths,
             config,
-            config_manager,
             pending_thread_unloads,
             thread_state_manager,
             thread_watch_manager,
@@ -94,13 +88,13 @@ impl TurnRequestProcessor {
             .map(|response| Some(response.into()))
     }
 
-    pub(crate) async fn queued_turn_start(
+    pub(crate) async fn validate_thread_queued_turn(
         &self,
         params: TurnStartParams,
-    ) -> Result<TurnStartResponse, JSONRPCErrorError> {
+    ) -> Result<(), JSONRPCErrorError> {
         Self::validate_v2_input_limit(&params.input)?;
-        let prepared = self.prepare_turn_start(params, None, None).await?;
-        self.submit_prepared_turn_start(prepared, None).await
+        self.prepare_queued_turn_start(params).await?;
+        Ok(())
     }
 
     pub(crate) async fn turn_steer(
@@ -214,23 +208,6 @@ impl TurnRequestProcessor {
 
         Ok((thread_id, thread))
     }
-    fn normalize_turn_start_collaboration_mode(
-        &self,
-        mut collaboration_mode: CollaborationMode,
-    ) -> CollaborationMode {
-        if collaboration_mode.settings.developer_instructions.is_none()
-            && let Some(instructions) = builtin_collaboration_mode_presets()
-                .into_iter()
-                .find(|preset| preset.mode == Some(collaboration_mode.mode))
-                .and_then(|preset| preset.developer_instructions.flatten())
-                .filter(|instructions| !instructions.is_empty())
-        {
-            collaboration_mode.settings.developer_instructions = Some(instructions);
-        }
-
-        collaboration_mode
-    }
-
     fn review_request_from_target(
         target: ApiReviewTarget,
     ) -> Result<(ReviewRequest, String), JSONRPCErrorError> {
@@ -282,27 +259,6 @@ impl TurnRequestProcessor {
         Ok((review_request, hint))
     }
 
-    fn parse_environment_selections(
-        &self,
-        environments: Option<Vec<TurnEnvironmentParams>>,
-    ) -> Result<Option<Vec<TurnEnvironmentSelection>>, JSONRPCErrorError> {
-        let environment_selections = environments.map(|environments| {
-            environments
-                .into_iter()
-                .map(|environment| TurnEnvironmentSelection {
-                    environment_id: environment.environment_id,
-                    cwd: environment.cwd,
-                })
-                .collect::<Vec<_>>()
-        });
-        if let Some(environment_selections) = environment_selections.as_ref() {
-            self.thread_manager
-                .validate_environment_selections(environment_selections)
-                .map_err(|err| invalid_request(environment_selection_error_message(err)))?;
-        }
-        Ok(environment_selections)
-    }
-
     async fn request_trace_context(
         &self,
         request_id: &ConnectionRequestId,
@@ -347,155 +303,52 @@ impl TurnRequestProcessor {
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
     ) -> Result<PreparedTurnStart, JSONRPCErrorError> {
-        let (thread_id, thread) = self.load_thread(&params.thread_id).await?;
-        Self::set_app_server_client_info(
-            thread.as_ref(),
-            app_server_client_name,
-            app_server_client_version,
+        self.prepare_turn_start_inner(
+            params,
+            Some((app_server_client_name, app_server_client_version)),
         )
-        .await?;
+        .await
+    }
 
-        let collaboration_mode = params
-            .collaboration_mode
-            .map(|mode| self.normalize_turn_start_collaboration_mode(mode));
-        let environment_selections = self.parse_environment_selections(params.environments)?;
+    async fn prepare_queued_turn_start(
+        &self,
+        params: TurnStartParams,
+    ) -> Result<PreparedTurnStart, JSONRPCErrorError> {
+        self.prepare_turn_start_inner(params, None).await
+    }
 
-        // Map v2 input items to core input items.
-        let mapped_items: Vec<CoreInputItem> = params
-            .input
-            .into_iter()
-            .map(V2UserInput::into_core)
-            .collect();
-        let turn_has_input = !mapped_items.is_empty();
-
-        let has_any_overrides = params.cwd.is_some()
-            || params.approval_policy.is_some()
-            || params.approvals_reviewer.is_some()
-            || params.sandbox_policy.is_some()
-            || params.permissions.is_some()
-            || params.model.is_some()
-            || params.service_tier.is_some()
-            || params.effort.is_some()
-            || params.summary.is_some()
-            || collaboration_mode.is_some()
-            || params.personality.is_some();
-
-        if params.sandbox_policy.is_some() && params.permissions.is_some() {
-            return Err(invalid_request(
-                "`permissions` cannot be combined with `sandboxPolicy`",
-            ));
+    async fn prepare_turn_start_inner(
+        &self,
+        params: TurnStartParams,
+        app_server_client_info: Option<(Option<String>, Option<String>)>,
+    ) -> Result<PreparedTurnStart, JSONRPCErrorError> {
+        let (thread_id, thread) = self.load_thread(&params.thread_id).await?;
+        if let Some((app_server_client_name, app_server_client_version)) = app_server_client_info {
+            Self::set_app_server_client_info(
+                thread.as_ref(),
+                app_server_client_name,
+                app_server_client_version,
+            )
+            .await?;
         }
-
-        let cwd = params.cwd;
-        let approval_policy = params.approval_policy.map(AskForApproval::to_core);
-        let approvals_reviewer = params
-            .approvals_reviewer
-            .map(codex_app_server_protocol::ApprovalsReviewer::to_core);
-        let sandbox_policy = params.sandbox_policy.map(|p| p.to_core());
-        let (permission_profile, active_permission_profile) =
-            if let Some(permissions) = params.permissions {
-                let snapshot = thread.config_snapshot().await;
-                let mut overrides = ConfigOverrides {
-                    cwd: cwd.clone(),
-                    codex_linux_sandbox_exe: self.arg0_paths.codex_linux_sandbox_exe.clone(),
-                    main_execve_wrapper_exe: self.arg0_paths.main_execve_wrapper_exe.clone(),
-                    ..Default::default()
-                };
-                apply_permission_profile_selection_to_config_overrides(
-                    &mut overrides,
-                    Some(permissions),
-                );
-                let config = self
-                    .config_manager
-                    .load_for_cwd(
-                        /*request_overrides*/ None,
-                        overrides,
-                        Some(snapshot.cwd.to_path_buf()),
-                    )
-                    .await
-                    .map_err(|err| config_load_error(&err))?;
-                // Startup config is allowed to fall back when requirements
-                // disallow a configured profile. An explicit turn request
-                // is different: reject it before accepting user input.
-                if let Some(warning) = config.startup_warnings.iter().find(|warning| {
-                    warning.contains("Configured value for `permission_profile` is disallowed")
-                }) {
-                    return Err(invalid_request(format!(
-                        "invalid turn context override: {warning}"
-                    )));
-                }
-                (
-                    Some(config.permissions.permission_profile()),
-                    config.permissions.active_permission_profile(),
-                )
-            } else {
-                (None, None)
-            };
-        let model = params.model;
-        let effort = params.effort.map(Some);
-        let summary = params.summary;
-        let service_tier = params.service_tier;
-        let personality = params.personality;
-
-        // If any overrides are provided, validate them synchronously so the
-        // request can fail before accepting user input. The actual update is
-        // still queued together with the input below to preserve submission order.
-        if has_any_overrides {
-            thread
-                .validate_turn_context_overrides(CodexThreadTurnContextOverrides {
-                    cwd: cwd.clone(),
-                    approval_policy,
-                    approvals_reviewer,
-                    sandbox_policy: sandbox_policy.clone(),
-                    permission_profile: permission_profile.clone(),
-                    active_permission_profile: active_permission_profile.clone(),
-                    windows_sandbox_level: None,
-                    model: model.clone(),
-                    effort,
-                    summary,
-                    service_tier: service_tier.clone(),
-                    collaboration_mode: collaboration_mode.clone(),
-                    personality,
-                })
-                .await
-                .map_err(|err| invalid_request(format!("invalid turn context override: {err}")))?;
-        }
-
-        // Start the turn by submitting the user input. Return its submission id as turn_id.
-        let turn_op = if has_any_overrides {
-            Op::UserInputWithTurnContext {
-                items: mapped_items,
-                environments: environment_selections,
-                final_output_json_schema: params.output_schema,
-                responsesapi_client_metadata: params.responsesapi_client_metadata,
-                cwd,
-                approval_policy,
-                approvals_reviewer,
-                sandbox_policy,
-                permission_profile,
-                active_permission_profile,
-                windows_sandbox_level: None,
-                model,
-                effort,
-                summary,
-                service_tier,
-                collaboration_mode,
-                personality,
-            }
-        } else {
-            Op::UserInput {
-                items: mapped_items,
-                environments: environment_selections,
-                final_output_json_schema: params.output_schema,
-                responsesapi_client_metadata: params.responsesapi_client_metadata,
-            }
-        };
+        let (turn_op, turn_has_input) = thread
+            .prepare_turn_start_op(params)
+            .await
+            .map_err(Self::prepare_turn_start_error)?;
         Ok(PreparedTurnStart {
             thread_id,
             thread,
             turn_op,
             turn_has_input,
         })
+    }
+
+    fn prepare_turn_start_error(err: CodexErr) -> JSONRPCErrorError {
+        match err {
+            CodexErr::InvalidRequest(message) => invalid_request(message),
+            CodexErr::Io(err) => config_load_error(&err),
+            err => internal_error(format!("failed to prepare turn start: {err}")),
+        }
     }
 
     async fn submit_prepared_turn_start(
@@ -515,15 +368,8 @@ impl TurnRequestProcessor {
             .map_err(|err| internal_error(format!("failed to start turn: {err}")))?;
 
         if turn_has_input {
-            let config_snapshot = thread.config_snapshot().await;
-            codex_memories_write::start_memories_startup_task(
-                Arc::clone(&self.thread_manager),
-                Arc::clone(&self.auth_manager),
-                thread_id,
-                Arc::clone(&thread),
-                thread.config().await,
-                &config_snapshot.session_source,
-            );
+            self.start_memories_startup_task_for_thread(thread_id, Arc::clone(&thread))
+                .await;
         }
 
         let turn = Turn {
@@ -538,6 +384,22 @@ impl TurnRequestProcessor {
         };
 
         Ok(TurnStartResponse { turn })
+    }
+
+    pub(crate) async fn start_memories_startup_task_for_thread(
+        &self,
+        thread_id: ThreadId,
+        thread: Arc<CodexThread>,
+    ) {
+        let config_snapshot = thread.config_snapshot().await;
+        codex_memories_write::start_memories_startup_task(
+            Arc::clone(&self.thread_manager),
+            Arc::clone(&self.auth_manager),
+            thread_id,
+            Arc::clone(&thread),
+            thread.config().await,
+            &config_snapshot.session_source,
+        );
     }
 
     async fn thread_inject_items_response_inner(

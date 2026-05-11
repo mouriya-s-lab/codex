@@ -141,6 +141,7 @@ fn event_msg_persistence_mode(ev: &EventMsg) -> Option<EventPersistenceMode> {
         | EventMsg::RawResponseItem(_)
         | EventMsg::SessionConfigured(_)
         | EventMsg::ThreadGoalUpdated(_)
+        | EventMsg::ThreadQueuedTurnDispatched(_)
         | EventMsg::McpToolCallBegin(_)
         | EventMsg::ExecCommandBegin(_)
         | EventMsg::TerminalInteraction(_)

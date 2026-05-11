@@ -2569,9 +2569,9 @@ impl ThreadRequestProcessor {
                 self.thread_queue_processor
                     .emit_thread_queue_snapshot(thread_id)
                     .await;
-                self.thread_queue_processor
-                    .drain_thread_queue_after_terminal_turn(thread_id)
-                    .await;
+                if let Err(err) = codex_thread.continue_queued_turn_if_idle().await {
+                    warn!("failed to continue queued turn after resume: {err}");
+                }
             }
             Err(err) => {
                 let error = internal_error(format!("error resuming thread: {err}"));

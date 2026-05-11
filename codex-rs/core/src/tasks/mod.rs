@@ -774,6 +774,9 @@ impl Session {
             if !cleared_active_turn {
                 return;
             }
+            if let Err(err) = self.maybe_start_thread_queued_turn_if_idle().await {
+                warn!("failed to continue queued turn after turn completion: {err}");
+            }
             if let Err(err) = self
                 .goal_runtime_apply(GoalRuntimeEvent::MaybeContinueIfIdle)
                 .await

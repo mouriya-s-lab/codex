@@ -1195,6 +1195,37 @@ impl Config {
         .await
     }
 
+    /// Rebuild this config from its current layer stack with fresh harness overrides.
+    pub async fn rebuild_with_overrides(
+        &self,
+        mut overrides: ConfigOverrides,
+    ) -> std::io::Result<Self> {
+        overrides.codex_self_exe = overrides
+            .codex_self_exe
+            .or_else(|| self.codex_self_exe.clone());
+        overrides.codex_linux_sandbox_exe = overrides
+            .codex_linux_sandbox_exe
+            .or_else(|| self.codex_linux_sandbox_exe.clone());
+        overrides.main_execve_wrapper_exe = overrides
+            .main_execve_wrapper_exe
+            .or_else(|| self.main_execve_wrapper_exe.clone());
+
+        let cfg: ConfigToml = self
+            .config_layer_stack
+            .effective_config()
+            .try_into()
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+
+        Self::load_config_with_layer_stack(
+            LOCAL_FS.as_ref(),
+            cfg,
+            overrides,
+            self.codex_home.clone(),
+            self.config_layer_stack.clone(),
+        )
+        .await
+    }
+
     /// This is the preferred way to create an instance of [Config].
     pub async fn load_with_cli_overrides(
         cli_overrides: Vec<(String, TomlValue)>,

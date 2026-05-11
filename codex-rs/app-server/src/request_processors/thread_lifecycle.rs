@@ -323,11 +323,14 @@ pub(super) async fn ensure_listener_task_running(
                         fallback_model_provider.clone(),
                     )
                     .await;
-                    if matches!(event.msg, EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_))
+                    if let EventMsg::ThreadQueuedTurnDispatched(dispatched) = &event.msg
                         && let Some(thread_queue_processor) = thread_queue_processor.as_ref()
                     {
                         thread_queue_processor
-                            .drain_thread_queue_after_terminal_turn(conversation_id)
+                            .on_queued_turn_dispatched(
+                                conversation_id,
+                                dispatched.turn_has_input,
+                            )
                             .await;
                     }
                 }

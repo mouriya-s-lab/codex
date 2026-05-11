@@ -52,6 +52,9 @@ impl ThreadQueueRequestProcessor {
             ));
         }
         let state_db = self.state_db_for_materialized_thread(thread_id).await?;
+        self.turn_processor
+            .validate_thread_queued_turn(params.turn_start_params.clone())
+            .await?;
         let turn_start_params_json =
             serde_json::to_string(&params.turn_start_params).map_err(|err| {
                 internal_error(format!("failed to serialize queued turn params: {err}"))
@@ -65,7 +68,7 @@ impl ThreadQueueRequestProcessor {
         let queued_turns = read_api_thread_queue(&state_db, thread_id).await?;
         self.emit_thread_queue_changed_ordered(thread_id, queued_turns)
             .await;
-        self.drain_thread_queue_if_idle(thread_id, &state_db).await;
+        self.continue_queued_turn_if_idle(thread_id).await;
         Ok(Some(ThreadQueueAddResponse { queued_turn }.into()))
     }
 
@@ -113,92 +116,30 @@ impl ThreadQueueRequestProcessor {
         Ok(Some(ThreadQueueReorderResponse { queued_turns }.into()))
     }
 
-    pub(crate) async fn drain_thread_queue_after_terminal_turn(&self, thread_id: ThreadId) {
-        let state_db = match self.state_db_for_materialized_thread(thread_id).await {
-            Ok(state_db) => state_db,
-            Err(err) => {
-                warn!(
-                    "failed to open state db before draining thread queue for {thread_id}: {}",
-                    err.message
-                );
-                return;
-            }
-        };
-        self.drain_thread_queue_if_idle(thread_id, &state_db).await;
-    }
-
-    async fn drain_thread_queue_if_idle(&self, thread_id: ThreadId, state_db: &StateDbHandle) {
+    async fn continue_queued_turn_if_idle(&self, thread_id: ThreadId) {
         let Ok(thread) = self.thread_manager.get_thread(thread_id).await else {
             return;
         };
-        if self
-            .thread_has_live_in_progress_turn(thread_id, thread.as_ref())
-            .await
-        {
-            return;
-        }
-        let queued_turn = match state_db.first_thread_queued_turn(thread_id).await {
-            Ok(Some(queued_turn)) => queued_turn,
-            Ok(None) => return,
-            Err(err) => {
-                warn!("failed to read next queued turn for {thread_id}: {err}");
-                return;
-            }
-        };
-        let turn_start_params =
-            match serde_json::from_str(queued_turn.turn_start_params_json.as_str()) {
-                Ok(turn_start_params) => turn_start_params,
-                Err(err) => {
-                    warn!("failed to decode next queued turn for {thread_id}: {err}");
-                    return;
-                }
-            };
-
-        match self
-            .turn_processor
-            .queued_turn_start(turn_start_params)
-            .await
-        {
-            Ok(_) => {
-                if let Err(err) = state_db
-                    .delete_thread_queued_turn(thread_id, queued_turn.queued_turn_id.as_str())
-                    .await
-                {
-                    warn!(
-                        "failed to remove dispatched queued turn {} for {thread_id}: {err}",
-                        queued_turn.queued_turn_id
-                    );
-                    return;
-                }
-            }
-            Err(error) => {
-                warn!(
-                    "failed to dispatch queued turn {} for {thread_id}: {}",
-                    queued_turn.queued_turn_id, error.message
-                );
-                return;
-            }
-        }
-
-        match read_api_thread_queue(state_db, thread_id).await {
-            Ok(queued_turns) => {
-                self.emit_thread_queue_changed_ordered(thread_id, queued_turns)
-                    .await;
-            }
-            Err(err) => warn!("{}", err.message),
+        if let Err(err) = thread.continue_queued_turn_if_idle().await {
+            warn!("failed to continue queued turn for {thread_id}: {err}");
         }
     }
 
-    async fn thread_has_live_in_progress_turn(
+    pub(crate) async fn on_queued_turn_dispatched(
         &self,
         thread_id: ThreadId,
-        thread: &CodexThread,
-    ) -> bool {
-        if matches!(thread.agent_status().await, AgentStatus::Running) {
-            return true;
+        turn_has_input: bool,
+    ) {
+        self.emit_thread_queue_snapshot(thread_id).await;
+        if !turn_has_input {
+            return;
         }
-        let thread_state = self.thread_state_manager.thread_state(thread_id).await;
-        thread_state.lock().await.active_turn_snapshot().is_some()
+        let Ok(thread) = self.thread_manager.get_thread(thread_id).await else {
+            return;
+        };
+        self.turn_processor
+            .start_memories_startup_task_for_thread(thread_id, thread)
+            .await;
     }
 
     async fn state_db_for_materialized_thread(

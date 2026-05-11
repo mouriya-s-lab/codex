@@ -12,8 +12,10 @@ use tracing::info_span;
 use crate::session::SteerInputError;
 use crate::session::session::Session;
 use crate::session::session::SessionSettingsUpdate;
+use crate::state::ActiveTurn;
 
 use crate::config::Config;
+use crate::config::ConfigOverrides;
 use crate::realtime_context::REALTIME_TURN_TOKEN_BUDGET;
 use crate::realtime_context::truncate_realtime_text_to_token_budget;
 use crate::realtime_conversation::REALTIME_USER_TEXT_PREFIX;
@@ -24,6 +26,13 @@ use crate::tasks::CompactTask;
 use crate::tasks::UserShellCommandMode;
 use crate::tasks::UserShellCommandTask;
 use crate::tasks::execute_user_shell_command;
+use codex_app_server_protocol::PermissionProfileModificationParams;
+use codex_app_server_protocol::PermissionProfileSelectionParams;
+use codex_app_server_protocol::TurnEnvironmentParams;
+use codex_app_server_protocol::TurnStartParams;
+use codex_app_server_protocol::UserInput as V2UserInput;
+use codex_models_manager::collaboration_mode_presets::builtin_collaboration_mode_presets;
+use codex_protocol::error::CodexErr;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::protocol::CodexErrorInfo;
@@ -43,6 +52,7 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::TurnAbortReason;
+use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputResponse;
@@ -112,7 +122,327 @@ pub(super) async fn user_input_or_turn_inner(
     op: Op,
     mirror_user_text_to_realtime: Option<()>,
 ) {
-    let (items, updates, responsesapi_client_metadata) = match op {
+    let (items, updates, responsesapi_client_metadata) = prepare_user_input_or_turn(sess, op).await;
+
+    let Ok(current_context) = sess.new_turn_with_sub_id(sub_id.clone(), updates).await else {
+        // new_turn_with_sub_id already emits the error event.
+        return;
+    };
+    sess.maybe_emit_unknown_model_warning_for_turn(current_context.as_ref())
+        .await;
+    let accepted_items = match sess
+        .steer_input(
+            items.clone(),
+            /*expected_turn_id*/ None,
+            responsesapi_client_metadata.clone(),
+        )
+        .await
+    {
+        Ok(_) => {
+            current_context.session_telemetry.user_prompt(&items);
+            Some(items)
+        }
+        Err(SteerInputError::NoActiveTurn(items)) => {
+            start_regular_turn(
+                sess,
+                Arc::clone(&current_context),
+                items,
+                responsesapi_client_metadata,
+            )
+            .await
+        }
+        Err(err) => {
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::Error(err.to_error_event()),
+            })
+            .await;
+            None
+        }
+    };
+    if let (Some(items), Some(())) = (accepted_items, mirror_user_text_to_realtime) {
+        self::mirror_user_text_to_realtime(sess, &items).await;
+    }
+}
+
+pub(crate) async fn maybe_start_queued_turn(sess: &Arc<Session>, sub_id: String, op: Op) -> bool {
+    let (items, updates, responsesapi_client_metadata) = prepare_user_input_or_turn(sess, op).await;
+    let reserved_turn_state = {
+        let mut active_turn = sess.active_turn.lock().await;
+        if active_turn.is_some() {
+            return false;
+        }
+        let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
+        Arc::clone(&active_turn.turn_state)
+    };
+    let Ok(current_context) = sess.new_turn_with_sub_id(sub_id, updates).await else {
+        clear_reserved_queued_turn(sess, &reserved_turn_state).await;
+        return false;
+    };
+    sess.maybe_emit_unknown_model_warning_for_turn(current_context.as_ref())
+        .await;
+    let still_reserved = {
+        let active_turn = sess.active_turn.lock().await;
+        active_turn.as_ref().is_some_and(|active_turn| {
+            active_turn.tasks.is_empty()
+                && Arc::ptr_eq(&active_turn.turn_state, &reserved_turn_state)
+        })
+    };
+    if !still_reserved {
+        clear_reserved_queued_turn(sess, &reserved_turn_state).await;
+        return false;
+    }
+    start_reserved_regular_turn(sess, current_context, items, responsesapi_client_metadata)
+        .await
+        .is_some()
+}
+
+pub(crate) async fn prepare_turn_start_op(
+    sess: &Arc<Session>,
+    params: TurnStartParams,
+) -> codex_protocol::error::Result<(Op, bool)> {
+    if params.thread_id != sess.conversation_id.to_string() {
+        return Err(CodexErr::InvalidRequest(
+            "turnStartParams.threadId must match the active thread".to_string(),
+        ));
+    }
+
+    let collaboration_mode = params
+        .collaboration_mode
+        .map(normalize_turn_start_collaboration_mode);
+    let environment_selections = parse_turn_environment_selections(sess, params.environments)?;
+    let mapped_items = params
+        .input
+        .into_iter()
+        .map(V2UserInput::into_core)
+        .collect::<Vec<_>>();
+    let turn_has_input = !mapped_items.is_empty();
+
+    let has_any_overrides = params.cwd.is_some()
+        || params.approval_policy.is_some()
+        || params.approvals_reviewer.is_some()
+        || params.sandbox_policy.is_some()
+        || params.permissions.is_some()
+        || params.model.is_some()
+        || params.service_tier.is_some()
+        || params.effort.is_some()
+        || params.summary.is_some()
+        || collaboration_mode.is_some()
+        || params.personality.is_some();
+
+    if params.sandbox_policy.is_some() && params.permissions.is_some() {
+        return Err(CodexErr::InvalidRequest(
+            "`permissions` cannot be combined with `sandboxPolicy`".to_string(),
+        ));
+    }
+
+    let cwd = params.cwd;
+    let approval_policy = params.approval_policy.map(|policy| policy.to_core());
+    let approvals_reviewer = params.approvals_reviewer.map(|reviewer| reviewer.to_core());
+    let sandbox_policy = params.sandbox_policy.map(|policy| policy.to_core());
+    let (permission_profile, active_permission_profile) =
+        resolve_turn_permission_selection(sess, cwd.clone(), params.permissions).await?;
+    let model = params.model;
+    let effort = params.effort.map(Some);
+    let summary = params.summary;
+    let service_tier = params.service_tier;
+    let personality = params.personality;
+
+    if has_any_overrides {
+        validate_turn_start_settings(
+            sess,
+            cwd.clone(),
+            approval_policy,
+            approvals_reviewer,
+            sandbox_policy.clone(),
+            permission_profile.clone(),
+            active_permission_profile.clone(),
+            model.clone(),
+            effort,
+            summary,
+            service_tier.clone(),
+            collaboration_mode.clone(),
+            personality,
+        )
+        .await?;
+    }
+
+    let turn_op = if has_any_overrides {
+        Op::UserInputWithTurnContext {
+            items: mapped_items,
+            environments: environment_selections,
+            final_output_json_schema: params.output_schema,
+            responsesapi_client_metadata: params.responsesapi_client_metadata,
+            cwd,
+            approval_policy,
+            approvals_reviewer,
+            sandbox_policy,
+            permission_profile,
+            active_permission_profile,
+            windows_sandbox_level: None,
+            model,
+            effort,
+            summary,
+            service_tier,
+            collaboration_mode,
+            personality,
+        }
+    } else {
+        Op::UserInput {
+            items: mapped_items,
+            environments: environment_selections,
+            final_output_json_schema: params.output_schema,
+            responsesapi_client_metadata: params.responsesapi_client_metadata,
+        }
+    };
+
+    Ok((turn_op, turn_has_input))
+}
+
+fn normalize_turn_start_collaboration_mode(
+    mut collaboration_mode: CollaborationMode,
+) -> CollaborationMode {
+    if collaboration_mode.settings.developer_instructions.is_none()
+        && let Some(instructions) = builtin_collaboration_mode_presets()
+            .into_iter()
+            .find(|preset| preset.mode == Some(collaboration_mode.mode))
+            .and_then(|preset| preset.developer_instructions.flatten())
+            .filter(|instructions| !instructions.is_empty())
+    {
+        collaboration_mode.settings.developer_instructions = Some(instructions);
+    }
+
+    collaboration_mode
+}
+
+fn parse_turn_environment_selections(
+    sess: &Arc<Session>,
+    environments: Option<Vec<TurnEnvironmentParams>>,
+) -> codex_protocol::error::Result<Option<Vec<TurnEnvironmentSelection>>> {
+    let environment_selections = environments.map(|environments| {
+        environments
+            .into_iter()
+            .map(|environment| TurnEnvironmentSelection {
+                environment_id: environment.environment_id,
+                cwd: environment.cwd,
+            })
+            .collect::<Vec<_>>()
+    });
+
+    if let Some(environment_selections) = environment_selections.as_ref() {
+        crate::environment_selection::resolve_environment_selections(
+            sess.services.environment_manager.as_ref(),
+            environment_selections,
+        )?;
+    }
+
+    Ok(environment_selections)
+}
+
+async fn resolve_turn_permission_selection(
+    sess: &Arc<Session>,
+    cwd: Option<std::path::PathBuf>,
+    permissions: Option<PermissionProfileSelectionParams>,
+) -> codex_protocol::error::Result<(
+    Option<codex_protocol::models::PermissionProfile>,
+    Option<codex_protocol::models::ActivePermissionProfile>,
+)> {
+    let Some(permissions) = permissions else {
+        return Ok((None, None));
+    };
+
+    let snapshot = sess.thread_config_snapshot().await;
+    let config = sess.get_config().await;
+    let mut overrides = ConfigOverrides {
+        cwd: cwd.or_else(|| Some(snapshot.cwd.to_path_buf())),
+        ..Default::default()
+    };
+    apply_permission_profile_selection_to_config_overrides(&mut overrides, permissions);
+    let config = config.rebuild_with_overrides(overrides).await?;
+    if let Some(warning) = config
+        .startup_warnings
+        .iter()
+        .find(|warning| warning.contains("Configured value for `permission_profile` is disallowed"))
+    {
+        return Err(CodexErr::InvalidRequest(format!(
+            "invalid turn context override: {warning}"
+        )));
+    }
+
+    Ok((
+        Some(config.permissions.permission_profile()),
+        config.permissions.active_permission_profile(),
+    ))
+}
+
+fn apply_permission_profile_selection_to_config_overrides(
+    overrides: &mut ConfigOverrides,
+    permissions: PermissionProfileSelectionParams,
+) {
+    let PermissionProfileSelectionParams::Profile { id, modifications } = permissions;
+    overrides.default_permissions = Some(id);
+    overrides
+        .additional_writable_roots
+        .extend(modifications.unwrap_or_default().into_iter().map(
+            |modification| match modification {
+                PermissionProfileModificationParams::AdditionalWritableRoot { path } => {
+                    path.to_path_buf()
+                }
+            },
+        ));
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn validate_turn_start_settings(
+    sess: &Arc<Session>,
+    cwd: Option<std::path::PathBuf>,
+    approval_policy: Option<codex_protocol::protocol::AskForApproval>,
+    approvals_reviewer: Option<codex_protocol::config_types::ApprovalsReviewer>,
+    sandbox_policy: Option<codex_protocol::protocol::SandboxPolicy>,
+    permission_profile: Option<codex_protocol::models::PermissionProfile>,
+    active_permission_profile: Option<codex_protocol::models::ActivePermissionProfile>,
+    model: Option<String>,
+    effort: Option<Option<codex_protocol::openai_models::ReasoningEffort>>,
+    summary: Option<codex_protocol::config_types::ReasoningSummary>,
+    service_tier: Option<Option<String>>,
+    collaboration_mode: Option<CollaborationMode>,
+    personality: Option<codex_protocol::config_types::Personality>,
+) -> codex_protocol::error::Result<()> {
+    let collaboration_mode = if let Some(collaboration_mode) = collaboration_mode {
+        collaboration_mode
+    } else {
+        sess.collaboration_mode()
+            .await
+            .with_updates(model, effort, /*developer_instructions*/ None)
+    };
+
+    sess.validate_settings(&SessionSettingsUpdate {
+        cwd,
+        approval_policy,
+        approvals_reviewer,
+        sandbox_policy,
+        permission_profile,
+        active_permission_profile,
+        windows_sandbox_level: None,
+        collaboration_mode: Some(collaboration_mode),
+        reasoning_summary: summary,
+        service_tier,
+        personality,
+        ..Default::default()
+    })
+    .await
+    .map_err(|err| CodexErr::InvalidRequest(format!("invalid turn context override: {err}")))
+}
+
+async fn prepare_user_input_or_turn(
+    sess: &Arc<Session>,
+    op: Op,
+) -> (
+    Vec<UserInput>,
+    SessionSettingsUpdate,
+    Option<std::collections::HashMap<String, String>>,
+) {
+    match op {
         Op::UserTurn {
             cwd,
             approval_policy,
@@ -228,58 +558,58 @@ pub(super) async fn user_input_or_turn_inner(
             responsesapi_client_metadata,
         ),
         _ => unreachable!(),
-    };
+    }
+}
 
-    let Ok(current_context) = sess.new_turn_with_sub_id(sub_id.clone(), updates).await else {
-        // new_turn_with_sub_id already emits the error event.
-        return;
-    };
-    sess.maybe_emit_unknown_model_warning_for_turn(current_context.as_ref())
+async fn start_regular_turn(
+    sess: &Arc<Session>,
+    current_context: Arc<crate::session::turn_context::TurnContext>,
+    items: Vec<UserInput>,
+    responsesapi_client_metadata: Option<std::collections::HashMap<String, String>>,
+) -> Option<Vec<UserInput>> {
+    if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
+        current_context
+            .turn_metadata_state
+            .set_responsesapi_client_metadata(responsesapi_client_metadata);
+    }
+    current_context.session_telemetry.user_prompt(&items);
+    sess.refresh_mcp_servers_if_requested(&current_context, Some(sess.mcp_elicitation_reviewer()))
         .await;
-    let accepted_items = match sess
-        .steer_input(
-            items.clone(),
-            /*expected_turn_id*/ None,
-            responsesapi_client_metadata.clone(),
-        )
-        .await
-    {
-        Ok(_) => {
-            current_context.session_telemetry.user_prompt(&items);
-            Some(items)
-        }
-        Err(SteerInputError::NoActiveTurn(items)) => {
-            if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
-                current_context
-                    .turn_metadata_state
-                    .set_responsesapi_client_metadata(responsesapi_client_metadata);
-            }
-            current_context.session_telemetry.user_prompt(&items);
-            sess.refresh_mcp_servers_if_requested(
-                &current_context,
-                Some(sess.mcp_elicitation_reviewer()),
-            )
-            .await;
-            let accepted_items = items.clone();
-            sess.spawn_task(
-                Arc::clone(&current_context),
-                items,
-                crate::tasks::RegularTask::new(),
-            )
-            .await;
-            Some(accepted_items)
-        }
-        Err(err) => {
-            sess.send_event_raw(Event {
-                id: sub_id,
-                msg: EventMsg::Error(err.to_error_event()),
-            })
-            .await;
-            None
-        }
-    };
-    if let (Some(items), Some(())) = (accepted_items, mirror_user_text_to_realtime) {
-        self::mirror_user_text_to_realtime(sess, &items).await;
+    let accepted_items = items.clone();
+    sess.spawn_task(current_context, items, crate::tasks::RegularTask::new())
+        .await;
+    Some(accepted_items)
+}
+
+async fn start_reserved_regular_turn(
+    sess: &Arc<Session>,
+    current_context: Arc<crate::session::turn_context::TurnContext>,
+    items: Vec<UserInput>,
+    responsesapi_client_metadata: Option<std::collections::HashMap<String, String>>,
+) -> Option<Vec<UserInput>> {
+    if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
+        current_context
+            .turn_metadata_state
+            .set_responsesapi_client_metadata(responsesapi_client_metadata);
+    }
+    current_context.session_telemetry.user_prompt(&items);
+    sess.refresh_mcp_servers_if_requested(&current_context, Some(sess.mcp_elicitation_reviewer()))
+        .await;
+    let accepted_items = items.clone();
+    sess.start_task(current_context, items, crate::tasks::RegularTask::new())
+        .await;
+    Some(accepted_items)
+}
+
+async fn clear_reserved_queued_turn(
+    sess: &Arc<Session>,
+    reserved_turn_state: &Arc<tokio::sync::Mutex<crate::state::TurnState>>,
+) {
+    let mut active_turn = sess.active_turn.lock().await;
+    if active_turn.as_ref().is_some_and(|active_turn| {
+        active_turn.tasks.is_empty() && Arc::ptr_eq(&active_turn.turn_state, reserved_turn_state)
+    }) {
+        *active_turn = None;
     }
 }
 
