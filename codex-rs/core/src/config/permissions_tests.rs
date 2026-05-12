@@ -66,6 +66,7 @@ async fn restricted_read_implicitly_allows_helper_executables() -> std::io::Resu
                 entries: BTreeMap::from([(
                     "workspace".to_string(),
                     PermissionProfileToml {
+                        extends: None,
                         filesystem: Some(FilesystemPermissionsToml {
                             glob_scan_max_depth: None,
                             entries: BTreeMap::new(),
@@ -237,6 +238,225 @@ fn network_toml_overlays_unix_socket_permissions_by_path() {
 }
 
 #[test]
+fn permissions_profiles_resolve_extends_parent_first_with_child_overrides() {
+    let permissions = PermissionsToml {
+        entries: BTreeMap::from([
+            (
+                "base".to_string(),
+                PermissionProfileToml {
+                    extends: None,
+                    filesystem: Some(FilesystemPermissionsToml {
+                        glob_scan_max_depth: Some(1),
+                        entries: BTreeMap::from([
+                            (
+                                "/tmp/base".to_string(),
+                                FilesystemPermissionToml::Access(FileSystemAccessMode::Read),
+                            ),
+                            (
+                                "/tmp/shared".to_string(),
+                                FilesystemPermissionToml::Access(FileSystemAccessMode::Read),
+                            ),
+                            (
+                                ":project_roots".to_string(),
+                                FilesystemPermissionToml::Scoped(BTreeMap::from([
+                                    ("**/*.env".to_string(), FileSystemAccessMode::None),
+                                    ("docs".to_string(), FileSystemAccessMode::Read),
+                                ])),
+                            ),
+                        ]),
+                    }),
+                    network: Some(NetworkToml {
+                        enabled: Some(true),
+                        domains: Some(NetworkDomainPermissionsToml {
+                            entries: BTreeMap::from([
+                                (
+                                    "base.example.com".to_string(),
+                                    NetworkDomainPermissionToml::Allow,
+                                ),
+                                (
+                                    "SHARED.EXAMPLE.COM.".to_string(),
+                                    NetworkDomainPermissionToml::Deny,
+                                ),
+                            ]),
+                        }),
+                        unix_sockets: Some(NetworkUnixSocketPermissionsToml {
+                            entries: BTreeMap::from([(
+                                "/tmp/base.sock".to_string(),
+                                NetworkUnixSocketPermissionToml::Allow,
+                            )]),
+                        }),
+                        ..Default::default()
+                    }),
+                },
+            ),
+            (
+                "child".to_string(),
+                PermissionProfileToml {
+                    extends: Some("base".to_string()),
+                    filesystem: Some(FilesystemPermissionsToml {
+                        glob_scan_max_depth: Some(3),
+                        entries: BTreeMap::from([
+                            (
+                                "/tmp/shared".to_string(),
+                                FilesystemPermissionToml::Access(FileSystemAccessMode::Write),
+                            ),
+                            (
+                                ":project_roots".to_string(),
+                                FilesystemPermissionToml::Scoped(BTreeMap::from([
+                                    ("docs".to_string(), FileSystemAccessMode::Write),
+                                    ("src".to_string(), FileSystemAccessMode::Read),
+                                ])),
+                            ),
+                        ]),
+                    }),
+                    network: Some(NetworkToml {
+                        enabled: Some(false),
+                        allow_local_binding: Some(true),
+                        domains: Some(NetworkDomainPermissionsToml {
+                            entries: BTreeMap::from([
+                                (
+                                    "child.example.com".to_string(),
+                                    NetworkDomainPermissionToml::Allow,
+                                ),
+                                (
+                                    "shared.example.com".to_string(),
+                                    NetworkDomainPermissionToml::Allow,
+                                ),
+                            ]),
+                        }),
+                        unix_sockets: Some(NetworkUnixSocketPermissionsToml {
+                            entries: BTreeMap::from([(
+                                "/tmp/child.sock".to_string(),
+                                NetworkUnixSocketPermissionToml::Allow,
+                            )]),
+                        }),
+                        ..Default::default()
+                    }),
+                },
+            ),
+        ]),
+    };
+
+    let resolved = permissions
+        .resolve_profile("child")
+        .expect("child profile should resolve");
+
+    assert_eq!(
+        resolved,
+        PermissionProfileToml {
+            extends: Some("base".to_string()),
+            filesystem: Some(FilesystemPermissionsToml {
+                glob_scan_max_depth: Some(3),
+                entries: BTreeMap::from([
+                    (
+                        "/tmp/base".to_string(),
+                        FilesystemPermissionToml::Access(FileSystemAccessMode::Read),
+                    ),
+                    (
+                        "/tmp/shared".to_string(),
+                        FilesystemPermissionToml::Access(FileSystemAccessMode::Write),
+                    ),
+                    (
+                        ":project_roots".to_string(),
+                        FilesystemPermissionToml::Scoped(BTreeMap::from([
+                            ("**/*.env".to_string(), FileSystemAccessMode::None),
+                            ("docs".to_string(), FileSystemAccessMode::Write),
+                            ("src".to_string(), FileSystemAccessMode::Read),
+                        ])),
+                    ),
+                ]),
+            }),
+            network: Some(NetworkToml {
+                enabled: Some(false),
+                allow_local_binding: Some(true),
+                domains: Some(NetworkDomainPermissionsToml {
+                    entries: BTreeMap::from([
+                        (
+                            "base.example.com".to_string(),
+                            NetworkDomainPermissionToml::Allow,
+                        ),
+                        (
+                            "child.example.com".to_string(),
+                            NetworkDomainPermissionToml::Allow,
+                        ),
+                        (
+                            "shared.example.com".to_string(),
+                            NetworkDomainPermissionToml::Allow,
+                        ),
+                    ]),
+                }),
+                unix_sockets: Some(NetworkUnixSocketPermissionsToml {
+                    entries: BTreeMap::from([
+                        (
+                            "/tmp/base.sock".to_string(),
+                            NetworkUnixSocketPermissionToml::Allow,
+                        ),
+                        (
+                            "/tmp/child.sock".to_string(),
+                            NetworkUnixSocketPermissionToml::Allow,
+                        ),
+                    ]),
+                }),
+                ..Default::default()
+            }),
+        }
+    );
+}
+
+#[test]
+fn permissions_profiles_reject_undefined_extends_parent() {
+    let permissions = PermissionsToml {
+        entries: BTreeMap::from([(
+            "child".to_string(),
+            PermissionProfileToml {
+                extends: Some("base".to_string()),
+                ..Default::default()
+            },
+        )]),
+    };
+
+    let err = permissions
+        .resolve_profile("child")
+        .expect_err("missing parent should be rejected");
+
+    assert_eq!(
+        err.to_string(),
+        "permissions profile `child` extends undefined profile `base`"
+    );
+}
+
+#[test]
+fn permissions_profiles_reject_extends_cycles() {
+    let permissions = PermissionsToml {
+        entries: BTreeMap::from([
+            (
+                "alpha".to_string(),
+                PermissionProfileToml {
+                    extends: Some("beta".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "beta".to_string(),
+                PermissionProfileToml {
+                    extends: Some("alpha".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]),
+    };
+
+    let err = permissions
+        .resolve_profile("alpha")
+        .expect_err("cycle should be rejected");
+
+    assert_eq!(
+        err.to_string(),
+        "permissions profile inheritance cycle detected: alpha -> beta -> alpha"
+    );
+}
+
+#[test]
 fn profile_network_proxy_config_keeps_proxy_disabled_for_bare_network_access() {
     let config = network_proxy_config_from_profile_network(Some(&NetworkToml {
         enabled: Some(true),
@@ -359,6 +579,7 @@ fn read_write_trailing_glob_suffix_compiles_as_subpath() -> std::io::Result<()> 
             entries: BTreeMap::from([(
                 "workspace".to_string(),
                 PermissionProfileToml {
+                    extends: None,
                     filesystem: Some(FilesystemPermissionsToml {
                         glob_scan_max_depth: None,
                         entries: BTreeMap::from([(

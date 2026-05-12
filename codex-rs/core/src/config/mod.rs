@@ -2436,20 +2436,30 @@ impl Config {
                 // when doing so would lose roots, network, or tmp settings.
                 None
             } else {
+                let selected_profile_extends = cfg
+                    .permissions
+                    .as_ref()
+                    .and_then(|permissions| permissions.entries.get(default_permissions))
+                    .and_then(|profile| profile.extends.clone());
                 let active_permission_profile = if !requested_additional_writable_roots.is_empty()
                     && matches!(permission_profile, PermissionProfile::Managed { .. })
                 {
-                    ActivePermissionProfile::new(default_permissions).with_modifications(
-                        requested_additional_writable_roots
-                            .iter()
-                            .cloned()
-                            .map(|path| {
-                                ActivePermissionProfileModification::AdditionalWritableRoot { path }
-                            })
-                            .collect(),
-                    )
+                    let mut active_permission_profile =
+                        ActivePermissionProfile::new(default_permissions);
+                    active_permission_profile.extends = selected_profile_extends;
+                    let modifications = requested_additional_writable_roots
+                        .iter()
+                        .cloned()
+                        .map(|path| {
+                            ActivePermissionProfileModification::AdditionalWritableRoot { path }
+                        })
+                        .collect();
+                    active_permission_profile.with_modifications(modifications)
                 } else {
-                    ActivePermissionProfile::new(default_permissions)
+                    let mut active_permission_profile =
+                        ActivePermissionProfile::new(default_permissions);
+                    active_permission_profile.extends = selected_profile_extends;
+                    active_permission_profile
                 };
                 Some(active_permission_profile)
             };

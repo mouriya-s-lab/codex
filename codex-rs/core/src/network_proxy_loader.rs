@@ -13,6 +13,7 @@ use codex_config::ConfigLayerStack;
 use codex_config::ConfigLayerStackOrdering;
 use codex_config::LoaderOverrides;
 use codex_config::loader::load_config_layers_state;
+use codex_config::merge_toml_values;
 use codex_config::permissions_toml::NetworkToml;
 use codex_config::permissions_toml::PermissionsToml;
 use codex_config::permissions_toml::overlay_network_domain_permissions;
@@ -117,6 +118,7 @@ fn network_constraints_from_trusted_layers(
     layers: &ConfigLayerStack,
 ) -> Result<NetworkProxyConstraints> {
     let mut constraints = NetworkProxyConstraints::default();
+    let mut merged = toml::Value::Table(toml::map::Map::new());
     for layer in layers.get_layers(
         ConfigLayerStackOrdering::LowestPrecedenceFirst,
         /*include_disabled*/ false,
@@ -125,7 +127,8 @@ fn network_constraints_from_trusted_layers(
             continue;
         }
 
-        let parsed = network_tables_from_toml(&layer.config)?;
+        merge_toml_values(&mut merged, &layer.config);
+        let parsed = network_tables_from_toml(&merged)?;
         if let Some(network) = selected_network_from_tables(parsed)? {
             apply_network_constraints(network, &mut constraints);
         }
@@ -195,7 +198,7 @@ fn selected_network_from_tables(parsed: NetworkTablesToml) -> Result<Option<Netw
         .context("default_permissions requires a `[permissions]` table for network settings")?;
     let profile = resolve_permission_profile(&permissions, &default_permissions)
         .map_err(anyhow::Error::from)?;
-    Ok(profile.network.clone())
+    Ok(profile.network)
 }
 
 fn apply_network_tables(config: &mut NetworkProxyConfig, parsed: NetworkTablesToml) -> Result<()> {
@@ -210,11 +213,13 @@ fn config_from_layers(
     exec_policy: &codex_execpolicy::Policy,
 ) -> Result<NetworkProxyConfig> {
     let mut config = NetworkProxyConfig::default();
+    let mut merged = toml::Value::Table(toml::map::Map::new());
     for layer in layers.get_layers(
         ConfigLayerStackOrdering::LowestPrecedenceFirst,
         /*include_disabled*/ false,
     ) {
-        let parsed = network_tables_from_toml(&layer.config)?;
+        merge_toml_values(&mut merged, &layer.config);
+        let parsed = network_tables_from_toml(&merged)?;
         apply_network_tables(&mut config, parsed)?;
     }
     apply_exec_policy_network_rules(&mut config, exec_policy);

@@ -183,16 +183,13 @@ pub(crate) fn apply_network_proxy_feature_config(
     .apply_to_network_proxy_config(config);
 }
 
-pub(crate) fn resolve_permission_profile<'a>(
-    permissions: &'a PermissionsToml,
+pub(crate) fn resolve_permission_profile(
+    permissions: &PermissionsToml,
     profile_name: &str,
-) -> io::Result<&'a PermissionProfileToml> {
-    permissions.entries.get(profile_name).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("default_permissions refers to undefined profile `{profile_name}`"),
-        )
-    })
+) -> io::Result<PermissionProfileToml> {
+    permissions
+        .resolve_profile(profile_name)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))
 }
 
 pub(crate) fn network_proxy_config_for_profile_selection(

@@ -9,6 +9,7 @@ use codex_protocol::permissions::FileSystemAccessMode;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
+use thiserror::Error;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 pub struct PermissionsToml {
@@ -20,13 +21,193 @@ impl PermissionsToml {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    pub fn resolve_profile(
+        &self,
+        profile_name: &str,
+    ) -> Result<PermissionProfileToml, PermissionProfileResolutionError> {
+        self.resolve_profile_inner(profile_name, &mut Vec::new(), /*referenced_by*/ None)
+    }
+
+    fn resolve_profile_inner(
+        &self,
+        profile_name: &str,
+        stack: &mut Vec<String>,
+        referenced_by: Option<&str>,
+    ) -> Result<PermissionProfileToml, PermissionProfileResolutionError> {
+        if let Some(cycle_start) = stack.iter().position(|name| name == profile_name) {
+            let cycle = stack[cycle_start..]
+                .iter()
+                .cloned()
+                .chain(std::iter::once(profile_name.to_string()))
+                .collect::<Vec<_>>();
+            return Err(PermissionProfileResolutionError::Cycle { cycle });
+        }
+
+        let profile = self.entries.get(profile_name).cloned().ok_or_else(|| {
+            referenced_by.map_or_else(
+                || PermissionProfileResolutionError::UndefinedProfile {
+                    profile_name: profile_name.to_string(),
+                },
+                |referenced_by| PermissionProfileResolutionError::UndefinedParent {
+                    profile_name: referenced_by.to_string(),
+                    parent_profile_name: profile_name.to_string(),
+                },
+            )
+        })?;
+
+        let Some(parent_profile_name) = profile.extends.as_deref() else {
+            return Ok(profile);
+        };
+
+        stack.push(profile_name.to_string());
+        let parent = self.resolve_profile_inner(
+            parent_profile_name,
+            stack,
+            /*referenced_by*/ Some(profile_name),
+        )?;
+        stack.pop();
+
+        Ok(merge_permission_profiles(parent, profile))
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct PermissionProfileToml {
+    pub extends: Option<String>,
     pub filesystem: Option<FilesystemPermissionsToml>,
     pub network: Option<NetworkToml>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum PermissionProfileResolutionError {
+    #[error("default_permissions refers to undefined profile `{profile_name}`")]
+    UndefinedProfile { profile_name: String },
+    #[error(
+        "permissions profile `{profile_name}` extends undefined profile `{parent_profile_name}`"
+    )]
+    UndefinedParent {
+        profile_name: String,
+        parent_profile_name: String,
+    },
+    #[error(
+        "permissions profile inheritance cycle detected: {}",
+        cycle.join(" -> ")
+    )]
+    Cycle { cycle: Vec<String> },
+}
+
+fn merge_permission_profiles(
+    parent: PermissionProfileToml,
+    child: PermissionProfileToml,
+) -> PermissionProfileToml {
+    PermissionProfileToml {
+        extends: child.extends,
+        filesystem: merge_filesystem_permissions(parent.filesystem, child.filesystem),
+        network: merge_network_permissions(parent.network, child.network),
+    }
+}
+
+fn merge_filesystem_permissions(
+    parent: Option<FilesystemPermissionsToml>,
+    child: Option<FilesystemPermissionsToml>,
+) -> Option<FilesystemPermissionsToml> {
+    match (parent, child) {
+        (Some(mut parent), Some(child)) => {
+            if child.glob_scan_max_depth.is_some() {
+                parent.glob_scan_max_depth = child.glob_scan_max_depth;
+            }
+            for (path, child_permission) in child.entries {
+                match (parent.entries.remove(&path), child_permission) {
+                    (
+                        Some(FilesystemPermissionToml::Scoped(mut parent_entries)),
+                        FilesystemPermissionToml::Scoped(child_entries),
+                    ) => {
+                        parent_entries.extend(child_entries);
+                        parent
+                            .entries
+                            .insert(path, FilesystemPermissionToml::Scoped(parent_entries));
+                    }
+                    (_, child_permission) => {
+                        parent.entries.insert(path, child_permission);
+                    }
+                }
+            }
+            Some(parent)
+        }
+        (Some(parent), None) => Some(parent),
+        (None, Some(child)) => Some(child),
+        (None, None) => None,
+    }
+}
+
+fn merge_network_permissions(
+    parent: Option<NetworkToml>,
+    child: Option<NetworkToml>,
+) -> Option<NetworkToml> {
+    match (parent, child) {
+        (Some(mut parent), Some(child)) => {
+            parent.enabled = child.enabled.or(parent.enabled);
+            parent.proxy_url = child.proxy_url.or(parent.proxy_url);
+            parent.enable_socks5 = child.enable_socks5.or(parent.enable_socks5);
+            parent.socks_url = child.socks_url.or(parent.socks_url);
+            parent.enable_socks5_udp = child.enable_socks5_udp.or(parent.enable_socks5_udp);
+            parent.allow_upstream_proxy =
+                child.allow_upstream_proxy.or(parent.allow_upstream_proxy);
+            parent.dangerously_allow_non_loopback_proxy = child
+                .dangerously_allow_non_loopback_proxy
+                .or(parent.dangerously_allow_non_loopback_proxy);
+            parent.dangerously_allow_all_unix_sockets = child
+                .dangerously_allow_all_unix_sockets
+                .or(parent.dangerously_allow_all_unix_sockets);
+            parent.mode = child.mode.or(parent.mode);
+            parent.allow_local_binding = child.allow_local_binding.or(parent.allow_local_binding);
+            parent.domains = merge_network_domain_permissions(parent.domains, child.domains);
+            parent.unix_sockets =
+                merge_network_unix_socket_permissions(parent.unix_sockets, child.unix_sockets);
+            Some(parent)
+        }
+        (Some(parent), None) => Some(parent),
+        (None, Some(child)) => Some(child),
+        (None, None) => None,
+    }
+}
+
+fn merge_network_domain_permissions(
+    parent: Option<NetworkDomainPermissionsToml>,
+    child: Option<NetworkDomainPermissionsToml>,
+) -> Option<NetworkDomainPermissionsToml> {
+    match (parent, child) {
+        (Some(parent), Some(child)) => {
+            let mut entries = BTreeMap::new();
+            for (pattern, permission) in parent.entries {
+                entries.insert(normalize_host(&pattern), permission);
+            }
+            for (pattern, permission) in child.entries {
+                entries.insert(normalize_host(&pattern), permission);
+            }
+            Some(NetworkDomainPermissionsToml { entries })
+        }
+        (Some(parent), None) => Some(parent),
+        (None, Some(child)) => Some(child),
+        (None, None) => None,
+    }
+}
+
+fn merge_network_unix_socket_permissions(
+    parent: Option<NetworkUnixSocketPermissionsToml>,
+    child: Option<NetworkUnixSocketPermissionsToml>,
+) -> Option<NetworkUnixSocketPermissionsToml> {
+    match (parent, child) {
+        (Some(mut parent), Some(child)) => {
+            parent.entries.extend(child.entries);
+            Some(parent)
+        }
+        (Some(parent), None) => Some(parent),
+        (None, Some(child)) => Some(child),
+        (None, None) => None,
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]

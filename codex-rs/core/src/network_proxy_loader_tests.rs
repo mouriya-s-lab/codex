@@ -1,9 +1,17 @@
 use super::*;
 
+use codex_app_server_protocol::ConfigLayerSource;
+use codex_config::ConfigLayerEntry;
+use codex_config::ConfigLayerStack;
+use codex_config::ConfigRequirements;
+use codex_config::ConfigRequirementsToml;
+use codex_config::permissions_toml::NetworkDomainPermissionToml;
+use codex_config::permissions_toml::NetworkDomainPermissionsToml;
 use codex_execpolicy::Decision;
 use codex_execpolicy::NetworkRuleProtocol;
 use codex_execpolicy::Policy;
 use pretty_assertions::assert_eq;
+use std::collections::BTreeMap;
 
 #[test]
 fn higher_precedence_profile_network_overlays_domain_entries() {
@@ -168,6 +176,108 @@ dangerously_allow_all_unix_sockets = true
     apply_network_constraints(network, &mut constraints);
 
     assert_eq!(constraints.dangerously_allow_all_unix_sockets, Some(true));
+}
+
+#[test]
+fn selected_network_from_tables_resolves_permission_profile_inheritance() {
+    let config: toml::Value = toml::from_str(
+        r#"
+default_permissions = "workspace"
+
+[permissions.base.network]
+enabled = true
+dangerously_allow_all_unix_sockets = true
+
+[permissions.base.network.domains]
+"base.example.com" = "allow"
+"shared.example.com" = "deny"
+
+[permissions.workspace]
+extends = "base"
+
+[permissions.workspace.network]
+allow_local_binding = true
+
+[permissions.workspace.network.domains]
+"child.example.com" = "allow"
+"shared.example.com" = "allow"
+"#,
+    )
+    .expect("permissions profiles should parse");
+
+    let network = selected_network_from_tables(
+        network_tables_from_toml(&config).expect("permissions profiles should deserialize"),
+    )
+    .expect("permissions profiles should select a network table")
+    .expect("network table should be present");
+
+    assert_eq!(
+        network,
+        NetworkToml {
+            enabled: Some(true),
+            dangerously_allow_all_unix_sockets: Some(true),
+            allow_local_binding: Some(true),
+            domains: Some(NetworkDomainPermissionsToml {
+                entries: BTreeMap::from([
+                    (
+                        "base.example.com".to_string(),
+                        NetworkDomainPermissionToml::Allow,
+                    ),
+                    (
+                        "child.example.com".to_string(),
+                        NetworkDomainPermissionToml::Allow,
+                    ),
+                    (
+                        "shared.example.com".to_string(),
+                        NetworkDomainPermissionToml::Allow,
+                    ),
+                ]),
+            }),
+            ..Default::default()
+        }
+    );
+}
+
+#[test]
+fn config_from_layers_resolves_inherited_profiles_across_layers() {
+    let lower_layer = ConfigLayerEntry::new(
+        ConfigLayerSource::SessionFlags,
+        toml::toml! {
+            [permissions.base.network.domains]
+            "base.example.com" = "allow"
+        }
+        .into(),
+    );
+    let higher_layer = ConfigLayerEntry::new(
+        ConfigLayerSource::SessionFlags,
+        toml::toml! {
+            default_permissions = "workspace"
+
+            [permissions.workspace]
+            extends = "base"
+
+            [permissions.workspace.network.domains]
+            "child.example.com" = "allow"
+        }
+        .into(),
+    );
+    let layers = ConfigLayerStack::new(
+        vec![lower_layer, higher_layer],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("layer stack should be valid");
+
+    let config =
+        config_from_layers(&layers, &Policy::empty()).expect("inherited profiles should load");
+
+    assert_eq!(
+        config.network.allowed_domains(),
+        Some(vec![
+            "base.example.com".to_string(),
+            "child.example.com".to_string(),
+        ])
+    );
 }
 
 #[test]
