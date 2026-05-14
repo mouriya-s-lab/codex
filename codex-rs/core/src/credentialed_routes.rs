@@ -5,6 +5,7 @@ use codex_network_proxy::CredentialedRouteProxyActionConfig;
 use codex_network_proxy::MitmHookActionsConfig;
 use codex_network_proxy::MitmHookConfig;
 use codex_network_proxy::MitmHookMatchConfig;
+use std::collections::BTreeSet;
 use tracing::debug;
 use tracing::warn;
 use url::Url;
@@ -71,6 +72,26 @@ impl CredentialedRoutesSessionConfig {
                 }
             })
             .collect()
+    }
+
+    pub(crate) fn developer_instructions(&self) -> Option<String> {
+        let route_prefixes = self
+            .routes
+            .iter()
+            .map(|route| route.base_url.clone())
+            .collect::<BTreeSet<_>>();
+        if route_prefixes.is_empty() {
+            return None;
+        }
+
+        let route_prefixes = route_prefixes
+            .into_iter()
+            .map(|route_prefix| format!("- {route_prefix}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(format!(
+            "The managed network proxy automatically attaches stored credentials when you call these HTTPS URL prefixes directly:\n{route_prefixes}"
+        ))
     }
 }
 
@@ -157,6 +178,42 @@ mod tests {
                 proxy_url: "https://chatgpt.com/backend-api/wham/credential_routes/proxy"
                     .to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn credentialed_routes_render_model_visible_prefixes() {
+        let config = CredentialedRoutesSessionConfig {
+            routes: vec![
+                ResolvedCredentialRoute {
+                    connector_id: "connector_b".to_string(),
+                    link_id: "link_b".to_string(),
+                    auth_type: CredentialRouteAuthType::OAuth,
+                    base_url: "https://b.example.com/v1".to_string(),
+                },
+                ResolvedCredentialRoute {
+                    connector_id: "connector_a".to_string(),
+                    link_id: "link_a".to_string(),
+                    auth_type: CredentialRouteAuthType::OAuth,
+                    base_url: "https://a.example.com/v1".to_string(),
+                },
+                ResolvedCredentialRoute {
+                    connector_id: "connector_a".to_string(),
+                    link_id: "link_a".to_string(),
+                    auth_type: CredentialRouteAuthType::OAuth,
+                    base_url: "https://a.example.com/v1".to_string(),
+                },
+            ],
+            proxy_url: Some(
+                "https://chatgpt.com/backend-api/wham/credential_routes/proxy".to_string(),
+            ),
+        };
+
+        assert_eq!(
+            config.developer_instructions(),
+            Some(
+                "The managed network proxy automatically attaches stored credentials when you call these HTTPS URL prefixes directly:\n- https://a.example.com/v1\n- https://b.example.com/v1".to_string()
+            )
         );
     }
 }
