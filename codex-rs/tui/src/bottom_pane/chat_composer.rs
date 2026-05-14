@@ -3961,6 +3961,7 @@ impl ChatComposer {
             return;
         }
 
+        let started_at = Instant::now();
         if query.is_empty() {
             self.app_event_tx
                 .send(AppEvent::StartFileSearch(String::new()));
@@ -3975,6 +3976,9 @@ impl ChatComposer {
             self.skills.as_deref(),
             self.plugins.as_deref(),
         );
+        let candidate_count = candidates.len();
+        let skill_count = self.skills.as_ref().map_or(0, std::vec::Vec::len);
+        let plugin_count = self.plugins.as_ref().map_or(0, std::vec::Vec::len);
 
         match &mut self.popups.active {
             ActivePopup::MentionV2(popup) => {
@@ -3988,6 +3992,14 @@ impl ChatComposer {
             }
         }
 
+        tracing::info!(
+            elapsed_us = started_at.elapsed().as_micros(),
+            query_len = query.len(),
+            candidate_count,
+            skill_count,
+            plugin_count,
+            "mentions v2 @ popup synchronized"
+        );
         self.popups.dismissed_mention_token = None;
     }
 
