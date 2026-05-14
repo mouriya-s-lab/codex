@@ -10,7 +10,6 @@ use crate::LogEntry;
 use crate::LogQuery;
 use crate::LogRow;
 use crate::STATE_DB_FILENAME;
-use crate::STATE_DB_VERSION;
 use crate::SecurityEvent;
 use crate::SecurityEventCreateParams;
 use crate::SecurityEventQuery;
