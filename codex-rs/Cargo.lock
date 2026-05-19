@@ -2189,6 +2189,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-channel-socket-bridge"
+version = "0.0.0"
+dependencies = [
+ "codex-app-server-client",
+ "codex-app-server-protocol",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "codex-chatgpt"
 version = "0.0.0"
 dependencies = [
@@ -3761,6 +3772,7 @@ dependencies = [
  "codex-app-server-client",
  "codex-app-server-protocol",
  "codex-arg0",
+ "codex-channel-socket-bridge",
  "codex-chatgpt",
  "codex-cli",
  "codex-cloud-requirements",

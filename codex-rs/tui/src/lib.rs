@@ -570,6 +570,12 @@ where
     })
     .await
     .wrap_err("failed to start embedded app server")?;
+    if let Some(socket_path) = std::env::var_os("CODEX_FORK_CHANNEL_SOCKET") {
+        let handle = client.request_handle();
+        tokio::spawn(async move {
+            codex_channel_socket_bridge::serve(handle, socket_path.into()).await;
+        });
+    }
     Ok(client)
 }
 

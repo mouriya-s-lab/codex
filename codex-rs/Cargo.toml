@@ -52,6 +52,7 @@ members = [
     "keyring-store",
     "file-search",
     "file-watcher",
+    "fork-features/codex-channel-socket-bridge",
     "linux-sandbox",
     "lmstudio",
     "login",
@@ -172,6 +173,7 @@ codex-install-context = { path = "install-context" }
 codex-file-search = { path = "file-search" }
 codex-file-watcher = { path = "file-watcher" }
 codex-git-utils = { path = "git-utils" }
+codex-channel-socket-bridge = { path = "fork-features/codex-channel-socket-bridge" }
 codex-hooks = { path = "hooks" }
 codex-keyring-store = { path = "keyring-store" }
 codex-linux-sandbox = { path = "linux-sandbox" }
