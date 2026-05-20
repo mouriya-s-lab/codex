@@ -9,6 +9,10 @@ autobins = false
 name = "codex-channel-socket-bridge-poc"
 path = "src/bin/poc.rs"
 
+[[bin]]
+name = "codex-channel-busy-concurrency-poc"
+path = "src/bin/busy_concurrency_poc.rs"
+
 [lib]
 name = "codex_channel_socket_bridge"
 path = "src/lib.rs"
