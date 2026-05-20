@@ -9,6 +9,10 @@ autobins = false
 name = "codex-channel-socket-bridge-poc"
 path = "src/bin/poc.rs"
 
+[[bin]]
+name = "codex-channel-reply-mcp-poc"
+path = "src/bin/channel_reply_mcp_poc.rs"
+
 [lib]
 name = "codex_channel_socket_bridge"
 path = "src/lib.rs"
@@ -19,6 +23,8 @@ workspace = true
 [dependencies]
 codex-app-server-client = { workspace = true }
 codex-app-server-protocol = { workspace = true }
+rmcp = { workspace = true, default-features = false, features = ["server", "transport-async-rw"] }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt", "sync"] }
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "rt", "sync"] }
 tracing = { workspace = true }

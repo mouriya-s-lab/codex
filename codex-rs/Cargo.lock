@@ -2194,6 +2194,8 @@ version = "0.0.0"
 dependencies = [
  "codex-app-server-client",
  "codex-app-server-protocol",
+ "rmcp",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
